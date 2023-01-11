@@ -1,9 +1,10 @@
 from enum import Enum
 from typing import Callable
 import torch
+import torch.nn as nn
 from torch.optim import Adam, SGD
 from torch.utils.data import TensorDataset, DataLoader
-from models import DeepDataDepthEncoder
+from deep_data_depth.models.DeepDataDepthEncoder import DeepDataDepthEncoder
 import logging
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,7 +17,7 @@ class DeepDataDepthAnomalyDetector:
     ])
 
     def __init__(self,
-                 method: Method = Method.KLDivFit,
+                 method: Method = Method.KlDivFit,
                  batch_size: int = 1000,
                  encoder_lr: float = 1e-3,
                  halfspace_optim_lr: float = 1e+3,
@@ -55,6 +56,9 @@ class DeepDataDepthAnomalyDetector:
         self.data_depth_computations = data_depth_computations
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        logging.log(logging.INFO, f'Using device {self.device}')
+        if torch.cuda.is_available():
+            logging.log(logging.INFO, f'The following GPU will be used: {torch.cuda.get_device_name()}')
 
     @staticmethod
     def soft_tukey_depth(X_: torch.Tensor, X: torch.Tensor, Z: torch.Tensor, temp: float) -> torch.Tensor:
@@ -74,8 +78,7 @@ class DeepDataDepthAnomalyDetector:
             val = torch.exp(torch.square(soft_tukey_depths - x).divide(
                 torch.tensor(-2 * kernel_bandwidth * kernel_bandwidth))).mean()
             f_val = f(x)
-            kl_divergence = kl_divergence.subtract(
-                torch.multiply(torch.tensor(f_val * delta), torch.log(val.divide(f_val + epsilon))))
+            kl_divergence = kl_divergence.subtract(f_val * delta * torch.log(val.divide(f_val + epsilon)))
         return kl_divergence
 
     @staticmethod
@@ -96,7 +99,7 @@ class DeepDataDepthAnomalyDetector:
         self.X_train = X_train
 
         train_tensor = TensorDataset(torch.from_numpy(X_train).float())
-        train_loader = DataLoader(train_tensor, batch_size=self.batch_size, shuffle=False, drop_last=True)
+        train_loader = DataLoader(train_tensor, batch_size=self.batch_size, shuffle=False)
         train_loader_full = DataLoader(train_tensor, batch_size=X_train.shape[0], shuffle=False)
 
         n = X_train.shape[0]
@@ -141,7 +144,7 @@ class DeepDataDepthAnomalyDetector:
                             )
 
                             for k in range(self.data_depth_computations):
-                                z = 2 * torch.rand(n, self.representation_dim).to(self.device) - 1
+                                z = nn.Parameter(2 * torch.rand(n, self.representation_dim).to(self.device) - 1)
                                 optimizer_z = SGD([z], lr=self.halfspace_optim_lr)
                                 for l in range(self.data_depth_iter):
                                     optimizer_z.zero_grad()
@@ -160,9 +163,9 @@ class DeepDataDepthAnomalyDetector:
                             tukey_depths = self.soft_tukey_depth(y_full, y, best_z, self.temp)
 
                             optimizer_encoder.zero_grad()
-                            if self.method == DeepDataDepthEncoder.Method.VarianceMaximization:
+                            if self.method == DeepDataDepthAnomalyDetector.Method.VarianceMaximization:
                                 loss = torch.var(tukey_depths)
-                            elif self.method == DeepDataDepthEncoder.Method.KLDivergence:
+                            elif self.method == DeepDataDepthAnomalyDetector.Method.KlDivFit:
                                 loss = self.get_kl_divergence(tukey_depths, self.target_dist)
                             loss.backward()
                             optimizer_encoder.step()
@@ -173,7 +176,7 @@ class DeepDataDepthAnomalyDetector:
                                     best_z[(step * self.batch_size):((step + 1) * self.batch_size)].detach(),
                                     self.temp
                                 )
-                    i += 1 / 2
+                    i += 0.5
                 if breaking:
                     break
             if breaking:
@@ -213,7 +216,7 @@ class DeepDataDepthAnomalyDetector:
                 tukey_depths = self.soft_tukey_depth(y_test_detached, y_train_detached, best_z, self.temp)
 
                 for i in range(2 * self.data_depth_computations):
-                    z = 2 * torch.rand(x_test.shape[0], self.representation_dim).to(self.device) - 1
+                    z = nn.Parameter(2 * torch.rand(x_test.shape[0], self.representation_dim).to(self.device) - 1)
                     optimizer_z = SGD([z], lr=self.halfspace_optim_lr)
                     for j in range(2 * self.data_depth_iter):
                         optimizer_z.zero_grad()
@@ -224,7 +227,7 @@ class DeepDataDepthAnomalyDetector:
                     current_tukey_depths = self.soft_tukey_depth(y_test_detached, y_train_detached, z, self.temp)
 
                     for j in range(current_tukey_depths.size(dim=0)):
-                        if current_tukey_depths[j] < best_z[j]:
+                        if current_tukey_depths[j] < tukey_depths[j]:
                             tukey_depths[j] = current_tukey_depths[j].detach()
                             best_z[j] = z[j].detach()
 
