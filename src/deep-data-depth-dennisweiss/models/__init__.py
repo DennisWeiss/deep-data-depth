@@ -1,0 +1,3 @@
+from DeepDataDepthEncoder import DeepDataDepthEncoder
+
+DeepDataDepthEncoder = DeepDataDepthEncoder

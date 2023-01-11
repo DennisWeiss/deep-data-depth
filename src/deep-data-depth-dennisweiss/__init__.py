@@ -1,0 +1,3 @@
+import DeepDataDepthAnomalyDetector
+
+DeepDataDepthAnomalyDetector = DeepDataDepthAnomalyDetector
