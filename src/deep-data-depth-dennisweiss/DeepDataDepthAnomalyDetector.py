@@ -6,6 +6,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from models import DeepDataDepthEncoder
 import logging
 import matplotlib.pyplot as plt
+import numpy as np
 
 
 class DeepDataDepthAnomalyDetector:
@@ -40,6 +41,7 @@ class DeepDataDepthAnomalyDetector:
         :param data_depth_iter (int, optional): Number of iterations of the halfspace optimizer (default: ``20``)
         :param data_depth_computations (int, optional): Number of re-computations of the data depth value (default: ``20``)
         """
+        self.X_train = None
         self.method = method
         self.batch_size = batch_size
         self.encoder_lr = encoder_lr
@@ -77,34 +79,35 @@ class DeepDataDepthAnomalyDetector:
         return kl_divergence
 
     @staticmethod
-    def draw_histogram(X, X_, z, temp, bins=100):
+    def draw_histogram(X: torch.Tensor, X_: torch.Tensor, z: torch.Tensor, temp:float, bins=100):
         soft_tukey_depths = DeepDataDepthEncoder.soft_tukey_depth(X, X_, z, temp)
         tukey_depth_histogram = plt.figure()
         plt.hist(soft_tukey_depths.detach().cpu().numpy(), bins=bins)
         tukey_depth_histogram.show()
 
-    def fit(self, X_train: torch.Tensor, y_train: torch.Tensor):
+    def fit(self, X_train: np.ndarray, y_train: np.ndarray):
         """
         :param X_train: Training data
         :param y_train: Training labels
         :return: self
         """
         X_train = X_train[y_train == 0]
-        y_train = y_train[y_train == 0]
+
+        self.X_train = X_train
 
         train_tensor = TensorDataset(torch.from_numpy(X_train).float())
         train_loader = DataLoader(train_tensor, batch_size=self.batch_size, shuffle=False, drop_last=True)
-        train_loader_full = DataLoader(train_tensor, batch_size=X_train.shape[0], shuffle=False, drop_last=True)
+        train_loader_full = DataLoader(train_tensor, batch_size=X_train.shape[0], shuffle=False)
 
         n = X_train.shape[0]
         input_dim = X_train.shape[1]
 
         hidden_layer_dim = min(max(input_dim, self.representation_dim), 2 * self.representation_dim)
 
-        encoder = DeepDataDepthEncoder(input_dim, hidden_layer_dim, self.representation_dim).to(self.device)
-        encoder.train()
+        self.encoder = DeepDataDepthEncoder(input_dim, hidden_layer_dim, self.representation_dim).to(self.device)
+        self.encoder.train()
 
-        optimizer_encoder = Adam(encoder.parameters(), lr=self.encoder_lr, weight_decay=self.weight_decay)
+        optimizer_encoder = Adam(self.encoder.parameters(), lr=self.encoder_lr, weight_decay=self.weight_decay)
 
         best_z = 2 * torch.rand(n, self.representation_dim).to(self.device) - 1
 
@@ -121,12 +124,12 @@ class DeepDataDepthAnomalyDetector:
                         breaking = True
                         break
                     x = x.to(self.device)
-                    y = encoder(x)
+                    y = self.encoder(x)
                     y_detached = y.detach()
 
                     for step2, (x_full,) in enumerate(train_loader_full):
                         x_full = x_full.to(self.device)
-                        y_full = encoder(x_full)
+                        y_full = self.encoder(x_full)
                         y_full_detached = y_full.detach()
 
                         if step_type == 'optimize_halfspace':
@@ -177,3 +180,54 @@ class DeepDataDepthAnomalyDetector:
                 break
 
         return self
+
+    def predict_score(self, x: np.ndarray) -> np.ndarray:
+        """
+        :param x: Data
+        :return: Anomaly scores
+        """
+        if self.X_train is None:
+            raise Exception('Model not fitted yet')
+
+        self.encoder.eval()
+
+        train_data = TensorDataset(torch.from_numpy(self.X_train).float())
+        train_loader = DataLoader(train_data, batch_size=self.X_train.shape[0], shuffle=False)
+
+        test_data = TensorDataset(torch.from_numpy(x).float())
+        test_loader = DataLoader(test_data, batch_size=self.batch_size, shuffle=False, drop_last=False)
+
+        scores = np.zeros(0)
+
+        for step, (x_train,) in enumerate(train_loader):
+            x_train = x_train.to(self.device)
+            y_train = self.encoder(x_train)
+            y_train_detached = y_train.detach()
+
+            for step2, (x_test,) in enumerate(test_loader):
+                x_test = x_test.to(self.device)
+                y_test = self.encoder(x_test)
+                y_test_detached = y_test.detach()
+
+                best_z = 2 * torch.rand(x_test.shape[0], self.representation_dim).to(self.device) - 1
+                tukey_depths = self.soft_tukey_depth(y_test_detached, y_train_detached, best_z, self.temp)
+
+                for i in range(2 * self.data_depth_computations):
+                    z = 2 * torch.rand(x_test.shape[0], self.representation_dim).to(self.device) - 1
+                    optimizer_z = SGD([z], lr=self.halfspace_optim_lr)
+                    for j in range(2 * self.data_depth_iter):
+                        optimizer_z.zero_grad()
+                        current_tukey_depths = self.soft_tukey_depth(y_test_detached, y_train_detached, z, self.temp)
+                        current_tukey_depths.sum().backward()
+                        optimizer_z.step()
+
+                    current_tukey_depths = self.soft_tukey_depth(y_test_detached, y_train_detached, z, self.temp)
+
+                    for j in range(current_tukey_depths.size(dim=0)):
+                        if current_tukey_depths[j] < best_z[j]:
+                            tukey_depths[j] = current_tukey_depths[j].detach()
+                            best_z[j] = z[j].detach()
+
+                scores = np.concatenate((scores, (0.5 - tukey_depths).cpu().numpy()))
+
+        return scores
